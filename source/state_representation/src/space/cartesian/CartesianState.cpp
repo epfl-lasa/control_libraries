@@ -95,35 +95,90 @@ CartesianState& CartesianState::operator*=(const CartesianState& state) {
     throw IncompatibleReferenceFramesException("Expected " + this->get_name() + ", got " + state.get_reference_frame());
   }
   this->set_name(state.get_name());
-  // intermediate variables for f_S_b
-  Eigen::Vector3d f_P_b = this->get_position();
-  Eigen::Quaterniond f_R_b = this->get_orientation();
-  Eigen::Vector3d f_v_b = this->get_linear_velocity();
-  Eigen::Vector3d f_omega_b = this->get_angular_velocity();
-  Eigen::Vector3d f_a_b = this->get_linear_acceleration();
-  Eigen::Vector3d f_alpha_b = this->get_angular_acceleration();
+
+  // intermediate variables for a_S_b
+  auto a_P_b = this->get_position();
+  auto a_R_b = this->get_orientation();
+  auto a_R_b_M = a_R_b.toRotationMatrix();
+
+  auto a_v_b = this->get_linear_velocity();
+  auto a_omega_b = this->get_angular_velocity();
+  auto a_acc_b = this->get_linear_acceleration();
+  auto a_alpha_b = this->get_angular_acceleration();
+
   // intermediate variables for b_S_c
-  Eigen::Vector3d b_P_c = state.get_position();
-  Eigen::Quaterniond b_R_c = (this->get_orientation().dot(state.get_orientation()) > 0) ? state.get_orientation()
-                                                                                        : Eigen::Quaterniond(-state.get_orientation().coeffs());
-  Eigen::Vector3d b_v_c = state.get_linear_velocity();
-  Eigen::Vector3d b_omega_c = state.get_angular_velocity();
-  Eigen::Vector3d b_a_c = state.get_linear_acceleration();
-  Eigen::Vector3d b_alpha_c = state.get_angular_acceleration();
+  const auto& b_P_c = state.get_position();
+  auto b_R_c = (this->get_orientation().dot(state.get_orientation()) > 0) ? state.get_orientation()
+                                                                                               : Eigen::Quaterniond(-state.get_orientation().coeffs());
+  const auto& b_v_c = state.get_linear_velocity();
+  const auto& b_omega_c = state.get_angular_velocity();
+  const auto& b_acc_c = state.get_linear_acceleration();
+  const auto& b_alpha_c = state.get_angular_acceleration();
+
+  /* TWIST TRANSFORMATION
+   * a_V_c_B = a_X_b * b_V_c_B
+   *    a_V_c_B -> 6x1 Twist (linear then angular) of frame C relative to frame B expressed in frame A
+   *    b_V_c_B -> 6x1 Twist (linear then angular) of frame C relative to frame B expressed in frame B
+   *    a_X_b -> 6x6 adjoint action matrix of the homogeneous transform of frame B expressed in frame A
+   * a_X_b = [a_R_b, Xa_P_bX * a_R_b; zeros(3, 3), a_R_b]
+   *    a_R_b -> 3x3 rotation matrix of frame B expressed in frame A
+   *    Xa_P_bX -> 3x3 skew symmetric matrix form of 3x1 position vector of frame B expressed in frame A
+   */
+
+  /* WRENCH TRANSFORMATION
+   * a_W_c = b_X_a * b_W_c
+   *    a_W_c -> 6x1 Wrench (force then torque) of frame C relative to frame B expressed in frame A
+   *    b_W_c -> 6x1 Wrench (force then torque) of frame C relative to frame B expressed in frame B
+   *    b_X_a -> 6x6 adjoint action matrix of the homogeneous transform of frame A expressed in frame B
+   * b_X_a = [a_R_b, zeros(3, 3); Xa_P_bX * a_R_b, a_R_b]
+   *    a_R_b -> 3x3 rotation matrix of frame B expressed in frame A
+   *    Xa_P_bX -> 3x3 skew symmetric matrix form of 3x1 position vector of frame B expressed in frame A
+   */
+
+
+  Eigen::Matrix3d Xa_P_bX;
+  Xa_P_bX << 0, -a_P_b.z(), a_P_b.y(), a_P_b.z(), 0, -a_P_b.x(), -a_P_b.y(), a_P_b.x(), 0;
+
+  Eigen::MatrixXd a_X_b(6, 6);
+  a_X_b.setZero();
+  a_X_b.topLeftCorner<3, 3>() = a_R_b_M;
+  a_X_b.topRightCorner<3, 3>() = Xa_P_bX * a_R_b_M;
+  a_X_b.bottomRightCorner<3, 3>() = a_R_b_M;
+
+  Eigen::MatrixXd b_X_a = a_X_b;
+  b_X_a.bottomLeftCorner<3, 3>() = a_X_b.topRightCorner<3, 3>();
+  b_X_a.topRightCorner<3, 3>().setZero();
+
   // pose
-  this->set_position(f_P_b + f_R_b * b_P_c);
-  this->set_orientation(f_R_b * b_R_c);
+  this->set_position(a_P_b + a_R_b * b_P_c);
+  this->set_orientation(a_R_b * b_R_c);
+
   // twist
-  this->set_linear_velocity(f_v_b + f_R_b * b_v_c + f_omega_b.cross(f_R_b * b_P_c));
-  this->set_angular_velocity(f_omega_b + f_R_b * b_omega_c);
+
+  // The key difference in the twist calculation is the component of linear velocity that depends on the
+  // angular velocity. In the first method, this extra component is expressed as:
+  //    (1) a_omega_b.cross(a_R_b * b_P_c)
+  // But, in the second method, this extra component is expressed as:
+  //    (2) Xa_P_bX * a_R_b * b_omega_c
+  // So, (1) has the base frame angular velocity crossed with the rotated displacement of the follower frame,
+  // while (2) has the displacement of the base frame "crossed" with the rotated follower frame angular velocity
+  // TODO: understand the consequence of this difference in practice. It likely depends on the exact definition
+  //   of the twist being used ("left-trivialized" vs "right-trivialized", intrinsic vs extrinsic)
+
+//  this->set_linear_velocity(a_v_b + a_R_b * b_v_c + a_omega_b.cross(a_R_b * b_P_c));
+//  this->set_angular_velocity(a_omega_b + a_R_b * b_omega_c);
+  this->set_twist(this->get_twist() + a_X_b * state.get_twist());
+
   // acceleration
-  this->set_linear_acceleration(f_a_b + f_R_b * b_a_c
-                                + f_alpha_b.cross(f_R_b * b_P_c)
-                                + 2 * f_omega_b.cross(f_R_b * b_v_c)
-                                + f_omega_b.cross(f_omega_b.cross(f_R_b * b_P_c)));
-  this->set_angular_acceleration(f_alpha_b + f_R_b * b_alpha_c + f_omega_b.cross(f_R_b * b_omega_c));
+  this->set_linear_acceleration(a_acc_b + a_R_b * b_acc_c
+                                + a_alpha_b.cross(a_R_b * b_P_c)
+                                + 2 * a_omega_b.cross(a_R_b * b_v_c)
+                                + a_omega_b.cross(a_omega_b.cross(a_R_b * b_P_c)));
+  this->set_angular_acceleration(a_alpha_b + a_R_b * b_alpha_c + a_omega_b.cross(a_R_b * b_omega_c));
+
   // wrench
-  //TODO
+  this->set_wrench(this->get_wrench() + b_X_a * state.get_wrench());
+
   return (*this);
 }
 
@@ -203,29 +258,35 @@ CartesianState CartesianState::inverse() const {
   std::string ref = result.get_reference_frame();
   result.set_reference_frame(result.get_name());
   result.set_name(ref);
-  // intermediate variables for f_S_b
-  Eigen::Vector3d f_P_b = this->get_position();
-  Eigen::Quaterniond f_R_b = this->get_orientation();
-  Eigen::Vector3d f_v_b = this->get_linear_velocity();
-  Eigen::Vector3d f_omega_b = this->get_angular_velocity();
-  Eigen::Vector3d f_a_b = this->get_linear_acceleration();
-  Eigen::Vector3d f_alpha_b = this->get_angular_acceleration();
-  // computation for b_S_f
-  Eigen::Quaterniond b_R_f = f_R_b.conjugate();
-  Eigen::Vector3d b_P_f = b_R_f * (-f_P_b);
-  Eigen::Vector3d b_v_f = b_R_f * (-f_v_b);
-  Eigen::Vector3d b_omega_f = b_R_f * (-f_omega_b);
-  Eigen::Vector3d b_a_f = b_R_f * f_a_b;        // not sure if minus is needed
-  Eigen::Vector3d b_alpha_f = b_R_f * f_alpha_b;// no minus for sure
-  // wrench
-  //TODO
+  // intermediate variables for a_S_b
+  auto a_P_b = this->get_position();
+  auto a_R_b = this->get_orientation();
+  auto a_v_b = this->get_linear_velocity();
+  auto a_omega_b = this->get_angular_velocity();
+  auto a_acc_b = this->get_linear_acceleration();
+  auto a_alpha_b = this->get_angular_acceleration();
+  auto a_F_b = this->get_force();
+  auto a_T_b = this->get_torque();
+  // computation for b_S_a
+  auto b_R_a = a_R_b.conjugate();
+  auto b_P_a = b_R_a * (-a_P_b);
+  auto b_v_a = b_R_a * (-a_v_b);      // TODO: wrong, must account for angular velocity
+  auto b_omega_a = b_R_a * (-a_omega_b);
+  auto b_acc_a = b_R_a * a_acc_b;     // TODO: wrong, must account for angular velocity and acceleration
+  auto b_alpha_a = b_R_a * a_alpha_b; // TODO: wrong, must account for angular velocity
+  auto b_F_a = b_R_a * (-a_F_b);
+  auto b_T_a = b_R_a * (-a_T_b);      // TODO: wrong, must account for force
+
   // collect the results
-  result.set_position(b_P_f);
-  result.set_orientation(b_R_f);
-  result.set_linear_velocity(b_v_f);
-  result.set_angular_velocity(b_omega_f);
-  result.set_linear_acceleration(b_a_f);
-  result.set_angular_acceleration(b_alpha_f);
+  result.set_position(b_P_a);
+  result.set_orientation(b_R_a);
+  result.set_linear_velocity(b_v_a);
+  result.set_angular_velocity(b_omega_a);
+  result.set_linear_acceleration(b_acc_a);
+  result.set_angular_acceleration(b_alpha_a);
+  result.set_force(b_F_a);
+  result.set_torque(b_T_a);
+
   return result;
 }
 

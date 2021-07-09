@@ -348,6 +348,25 @@ TEST(CartesianStateTest, TestMultiplyInverseNonNullOrientation) {
   EXPECT_GT(abs(tf1.get_orientation().dot(rot_truth)), 1 - 10E-4);
 }
 
+TEST(CartesianStateTest, TestInverseStates) {
+  CartesianState a_state_b = CartesianState::Random("B", "A");
+  auto b_state_a = a_state_b.inverse();
+  auto expect_null = a_state_b * b_state_a;
+
+  EXPECT_NEAR(expect_null.get_pose().norm(), 1, 1e-5);
+  EXPECT_NEAR(expect_null.get_linear_velocity().norm(), 0, 1e-5);
+  EXPECT_NEAR(expect_null.get_angular_velocity().norm(), 0, 1e-5);
+  EXPECT_NEAR(expect_null.get_linear_acceleration().norm(), 0, 1e-5);
+  EXPECT_NEAR(expect_null.get_angular_acceleration().norm(), 0, 1e-5);
+  EXPECT_NEAR(expect_null.get_force().norm(), 0, 1e-5);
+  EXPECT_NEAR(expect_null.get_torque().norm(), 0, 1e-5);
+
+  // conservation of power must hold
+  auto power = a_state_b.get_twist().transpose() * a_state_b.get_wrench();
+  auto power_inverse = b_state_a.get_twist().transpose() * b_state_a.get_wrench();
+  EXPECT_NEAR(power, power_inverse, 1e-5);
+}
+
 TEST(CartesianStateTest, MultiplyPoseAndState) {
   CartesianPose p = CartesianPose::Random("test");
   CartesianState s = CartesianPose::Random("test2", "test");
@@ -392,9 +411,28 @@ TEST(CartesianStateTest, TestPoseToVelocity) {
   std::chrono::milliseconds dt3(100);
 }
 
-TEST(CartesianStateTest, TestTwistStateMultiplication) {
-  CartesianTwist twist = CartesianTwist::Random("test");
-  CartesianState state = CartesianTwist::Random("test2", "test");
+TEST(CartesianStateTest, TestStateStateMultiplication) {
+  CartesianState a_state_b = CartesianState::Identity("B", "A");
+  CartesianState b_state_c = CartesianState::Random("C", "B");
+
+  auto a_state_c = a_state_b * b_state_c;
+
+  // if the base frame is identity, the transformation should not affect the data
+  EXPECT_TRUE(a_state_c.get_pose().isApprox(b_state_c.get_pose()));
+  EXPECT_TRUE(a_state_c.get_accelerations().isApprox(b_state_c.get_accelerations()));
+  EXPECT_TRUE(a_state_c.get_twist().isApprox(b_state_c.get_twist()));
+  EXPECT_TRUE(a_state_c.get_wrench().isApprox(b_state_c.get_wrench()));
+
+  a_state_b = CartesianState::Random("B", "A");
+  a_state_c = a_state_b * b_state_c;
+
+  // conservation of power dictates that the product of force and velocity of
+  // frame C must be the same in any reference frame.
+  double b_power_c = b_state_c.get_twist().transpose() * b_state_c.get_wrench();
+  double projected_b_power_c = (a_state_c.get_twist() - a_state_b.get_twist()).transpose()
+      * (a_state_c.get_wrench() - a_state_b.get_wrench());
+
+  EXPECT_NEAR(b_power_c, projected_b_power_c, 1e-3);
 }
 
 TEST(CartesianStateTest, TestImplicitConversion) {
